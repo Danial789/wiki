@@ -5,8 +5,9 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 # --- STABLE DEPENDENCIES ---
-import pandas as pd
+import pylightxl as xl
 from pandastable import Table
+import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
@@ -19,7 +20,7 @@ class LeanDigitalTwin(tk.Tk):
     """
     An application for interacting with a GraphDB repository, visualizing data models,
     and linking data to Excel datasheets, creating a "Lean Digital Twin."
-    [VERSION: FINAL - Copy-to-Clipboard with Paste Button]
+    [VERSION: FINAL - Copy-to-Clipboard with Paste Button using pylightxl]
     """
 
     def __init__(self):
@@ -33,6 +34,7 @@ class LeanDigitalTwin(tk.Tk):
         self.graph = nx.DiGraph()
         self.pt_table = None
         self.current_workbook = None
+        self.current_xl_db = None
         self.active_node = None
 
         self.storage_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "excel_files")
@@ -484,11 +486,11 @@ class LeanDigitalTwin(tk.Tk):
                 abs_path = os.path.abspath(self.current_excel_path)
                 sheet_name = self.sheet_selector_combobox.get()
                 
-                workbook = load_workbook(abs_path)
-                if sheet_name not in workbook.sheetnames:
+                # Load with pylightxl
+                db = xl.readxl(fn=abs_path)
+                if sheet_name not in db.ws_names:
                     self.after(0, lambda: messagebox.showerror("Sheet Not Found", f"The sheet '{sheet_name}' was not found in the workbook."))
                     return
-                sheet = workbook[sheet_name]
 
                 prefix = self.entry_prefix.get().strip()
                 for prop, val_cell, unit_cell in self.properties:
@@ -503,11 +505,11 @@ class LeanDigitalTwin(tk.Tk):
                             val = res_direct[0]["value"]["value"]
                     
                     if val is not None and val_cell:
-                        sheet[val_cell] = val
+                        db.ws(ws=sheet_name).update_address(address=val_cell, val=val)
                     if uni is not None and unit_cell:
-                        sheet[unit_cell] = uni
+                        db.ws(ws=sheet_name).update_address(address=unit_cell, val=uni)
                 
-                workbook.save(abs_path)
+                xl.writexl(db=db, fn=abs_path)
                 self.after(0, lambda: self._refresh_open_datasheet(abs_path))
                 self.after(0, lambda: messagebox.showinfo("Success", "All mappings written to datasheet and saved."))
                 self.after(0, lambda: self._update_status("Successfully wrote all mappings to Excel.", 4000))
@@ -560,8 +562,12 @@ class LeanDigitalTwin(tk.Tk):
                 messagebox.showerror("File Not Found", f"The file could not be found at:\n{abs_path}")
                 return
             
+            # Load with pylightxl
+            self.current_xl_db = xl.readxl(fn=abs_path)
+            sheet_names = self.current_xl_db.ws_names
+            
+            # Also keep pandas ExcelFile for pandastable compatibility
             self.current_workbook = pd.ExcelFile(abs_path)
-            sheet_names = self.current_workbook.sheet_names
             
             self.sheet_selector_combobox['values'] = sheet_names
             if sheet_names:
@@ -573,6 +579,7 @@ class LeanDigitalTwin(tk.Tk):
         except Exception as e:
             messagebox.showerror("File Load Error", f"Failed to load the Excel file.\n\nError: {e}")
             self.current_workbook = None
+            self.current_xl_db = None
 
     def _on_sheet_selected(self, event=None):
         selected_sheet = self.sheet_selector_combobox.get()
@@ -599,9 +606,30 @@ class LeanDigitalTwin(tk.Tk):
             messagebox.showwarning("No File", "No datasheet is currently open to save.")
             return
         try:
+            # Get current dataframe from pandastable
             df = self.pt_table.model.df
-            with pd.ExcelWriter(self.current_excel_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
-                df.to_excel(writer, sheet_name=self.sheet_selector_combobox.get(), index=False)
+            sheet_name = self.sheet_selector_combobox.get()
+            
+            # Load existing workbook with pylightxl
+            db = xl.readxl(fn=self.current_excel_path)
+            
+            # Clear the sheet and write new data
+            if sheet_name in db.ws_names:
+                # Clear existing data
+                db.ws(ws=sheet_name).clear_all()
+            
+            # Write headers
+            for col_idx, col_name in enumerate(df.columns, 1):
+                db.ws(ws=sheet_name).update_index(row=1, col=col_idx, val=col_name)
+            
+            # Write data
+            for row_idx, (_, row) in enumerate(df.iterrows(), 2):
+                for col_idx, value in enumerate(row, 1):
+                    if pd.notna(value):  # Only write non-null values
+                        db.ws(ws=sheet_name).update_index(row=row_idx, col=col_idx, val=value)
+            
+            # Save with pylightxl
+            xl.writexl(db=db, fn=self.current_excel_path)
             
             self._update_status("File saved.", 4000)
         except Exception as e:
@@ -616,7 +644,25 @@ class LeanDigitalTwin(tk.Tk):
         try:
             abs_save_path = os.path.abspath(save_path)
             df = self.pt_table.model.df
-            df.to_excel(abs_save_path, index=False, engine='openpyxl')
+            sheet_name = self.sheet_selector_combobox.get()
+            
+            # Create new workbook with pylightxl
+            db = xl.Database()
+            db.add_ws(ws=sheet_name)
+            
+            # Write headers
+            for col_idx, col_name in enumerate(df.columns, 1):
+                db.ws(ws=sheet_name).update_index(row=1, col=col_idx, val=col_name)
+            
+            # Write data
+            for row_idx, (_, row) in enumerate(df.iterrows(), 2):
+                for col_idx, value in enumerate(row, 1):
+                    if pd.notna(value):  # Only write non-null values
+                        db.ws(ws=sheet_name).update_index(row=row_idx, col=col_idx, val=value)
+            
+            # Save with pylightxl
+            xl.writexl(db=db, fn=abs_save_path)
+            
             filename = os.path.basename(abs_save_path)
             internal_path = os.path.join(self.storage_dir, filename)
             if os.path.normpath(abs_save_path).lower() != os.path.normpath(internal_path).lower():
@@ -827,11 +873,11 @@ class LeanDigitalTwin(tk.Tk):
                 abs_path = os.path.abspath(self.current_excel_path)
                 sheet_name = self.sheet_selector_combobox.get()
                 
-                workbook = load_workbook(abs_path)
-                if sheet_name not in workbook.sheetnames:
+                # Load with pylightxl
+                db = xl.readxl(fn=abs_path)
+                if sheet_name not in db.ws_names:
                     self.after(0, lambda: messagebox.showerror("Sheet Not Found", f"The sheet '{sheet_name}' was not found in the workbook."))
                     return
-                sheet = workbook[sheet_name]
 
                 prefix = self.entry_prefix.get().strip()
                 
@@ -846,11 +892,11 @@ class LeanDigitalTwin(tk.Tk):
                         val = res_direct[0]["value"]["value"]
                 
                 if val is not None and val_cell:
-                    sheet[val_cell] = val
+                    db.ws(ws=sheet_name).update_address(address=val_cell, val=val)
                 if uni is not None and unit_cell:
-                    sheet[unit_cell] = uni
+                    db.ws(ws=sheet_name).update_address(address=unit_cell, val=uni)
             
-                workbook.save(abs_path)
+                xl.writexl(db=db, fn=abs_path)
                 self.after(0, lambda: self._refresh_open_datasheet(abs_path))
                 self.after(0, lambda: self._update_status(f"Mapping for {prop} executed successfully.", 4000))
             except Exception as e:
@@ -870,7 +916,7 @@ class LeanDigitalTwin(tk.Tk):
 
     def _paste_from_clipboard(self):
         """Paste the clipboard content into the currently selected cell in the datasheet"""
-        if not self.pt_table:
+        if not self.pt_table or not self.current_xl_db:
             messagebox.showwarning("No Datasheet", "Please open a datasheet first.")
             return
             
@@ -894,8 +940,27 @@ class LeanDigitalTwin(tk.Tk):
                 
             col_name = col_names[selected_col]
             
-            # Update the dataframe
+            # Update the dataframe (for display)
             self.pt_table.model.df.at[selected_row, col_name] = clipboard_content
+            
+            # Also update the pylightxl database
+            sheet_name = self.sheet_selector_combobox.get()
+            if sheet_name and self.current_excel_path:
+                # Calculate Excel cell address (row is 1-indexed for data, +1 for header)
+                excel_row = selected_row + 2  # +1 for 1-indexing, +1 for header
+                excel_col = selected_col + 1  # +1 for 1-indexing
+                
+                # Convert to letter format (A, B, C, etc.)
+                col_letter = get_column_letter(excel_col)
+                cell_address = f"{col_letter}{excel_row}"
+                
+                # Load, update, and save with pylightxl
+                db = xl.readxl(fn=self.current_excel_path)
+                db.ws(ws=sheet_name).update_address(address=cell_address, val=clipboard_content)
+                xl.writexl(db=db, fn=self.current_excel_path)
+                
+                # Update our cached database
+                self.current_xl_db = db
             
             # Refresh the table display
             self.pt_table.redraw()
