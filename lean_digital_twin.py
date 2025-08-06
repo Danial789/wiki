@@ -5,32 +5,56 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import re
 
+# --- PLATFORM-SPECIFIC CHECK ---
+if os.name != 'nt':
+    # This check is important because window embedding is a Windows-only feature.
+    messagebox.showerror("Unsupported OS",
+                         "This version of the application uses Windows-specific features (pywin32) to embed Excel and can only run on Windows.")
+    exit()
+
 # --- STABLE DEPENDENCIES ---
-import xlwings as xw  # Replaced previous library with xlwings
+import xlwings as xw
 import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from SPARQLWrapper import SPARQLWrapper, JSON
+import win32gui
+import win32con
 
 
 class LeanDigitalTwin(tk.Tk):
     """
     An application for interacting with a GraphDB repository, visualizing data models,
-    and linking data to Excel datasheets, creating a "Lean Digital Twin."
-    [VERSION: XLWINGS - Live Excel Automation]
+    and linking data to an embedded Excel datasheet.
+    [VERSION: XLWINGS - Embedded & Refined]
     """
 
     def __init__(self):
         super().__init__()
-        self.title("LEAN Digital Twin (xlwings Edition)")
-        self.geometry("1400x800")
+        self.initialization_ok = True  # Flag to track if setup is successful
+
+        # First, check for Excel installation before proceeding
+        try:
+            # Use a more reliable Excel check
+            app_check = xw.App(visible=False, add_book=False)
+            app_check.quit()
+        except Exception as e:
+            self.withdraw()  # Hide the root window before showing the error
+            messagebox.showerror("Excel Not Found",
+                                 "Could not connect to Microsoft Excel. Please ensure it is installed and accessible.\n\n"
+                                 f"Error: {e}")
+            self.initialization_ok = False
+            return  # Stop the initialization process
+
+        self.title("LEAN Digital Twin (Embedded Excel Edition)")
+        self.geometry("1400x850")
 
         self.properties = []
         self.current_excel_path = None
         self.tag_associations = {}
         self.graph = nx.DiGraph()
-        self.xl_app = None  # To hold the xlwings App instance
-        self.current_xl_db = None  # This will be our xlwings.Book object
+        self.xl_app = None
+        self.current_xl_db = None
         self.active_node = None
 
         self.storage_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "excel_files")
@@ -39,25 +63,31 @@ class LeanDigitalTwin(tk.Tk):
         self._configure_styles()
         self._create_main_ui()
 
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         self.after(100, self._update_file_lists)
         self.after(100, self._update_tag_lists)
 
-    def destroy(self):
-        """Custom destroy method to ensure Excel quits."""
+    def on_closing(self):
+        """Custom closing method to ensure Excel quits."""
         self._cleanup_xlwings()
-        super().destroy()
+        self.destroy()
 
     def _cleanup_xlwings(self):
         """Closes the Excel instance started by this application."""
         if self.xl_app:
             try:
+                # Un-parent the window before quitting to avoid graphical glitches
+                if hasattr(self.xl_app, 'hwnd') and self.xl_app.hwnd:
+                    try:
+                        win32gui.SetParent(self.xl_app.hwnd, 0)
+                    except:
+                        pass
                 self.xl_app.quit()
                 self.xl_app = None
                 self._update_status("Excel instance closed.", 2000)
             except Exception as e:
-                print(f"Could not quit Excel: {e}")
+                print(f"Could not quit Excel gracefully: {e}")
 
     def _configure_styles(self):
         self.style = ttk.Style(self)
@@ -84,7 +114,7 @@ class LeanDigitalTwin(tk.Tk):
 
         self.main_notebook.add(self.tab_graphical, text="Graphical Model")
         self.main_notebook.add(self.tab_graphdb, text="GraphDB → Excel")
-        self.main_notebook.add(self.tab_excel, text="Datasheet Viewer")
+        self.main_notebook.add(self.tab_excel, text="Datasheet Editor")
         self.main_notebook.add(self.tab_functionalities, text="Functionalities")
 
         self._build_graphical_model_tab(self.tab_graphical)
@@ -187,24 +217,15 @@ class LeanDigitalTwin(tk.Tk):
         sheet_controls_frame = ttk.Frame(table_container)
         sheet_controls_frame.grid(row=0, column=0, sticky="ew", pady=(0, 5))
 
-        ttk.Label(sheet_controls_frame, text="Activate Sheet in Excel:").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(sheet_controls_frame, text="Activate Sheet:").pack(side=tk.LEFT, padx=(0, 5))
 
         self.sheet_selector_combobox = ttk.Combobox(sheet_controls_frame, state="readonly")
         self.sheet_selector_combobox.pack(side=tk.LEFT, fill="x", expand=True)
         self.sheet_selector_combobox.bind("<<ComboboxSelected>>", lambda event: self._on_sheet_selected(event))
 
-        # --- REPLACEMENT FOR EMBEDDED VIEWER ---
         self.excel_frame = ttk.Frame(table_container, relief=tk.SUNKEN, borderwidth=1)
         self.excel_frame.grid(row=1, column=0, sticky="nsew")
-
-        info_label = ttk.Label(self.excel_frame,
-                               text="\n\nExcel file will be opened in a separate window.\n\n"
-                                    "Use the dropdown above to switch between sheets in the active Excel file.",
-                               font=('Segoe UI', 11, 'italic'),
-                               justify=tk.CENTER,
-                               anchor=tk.CENTER)
-        info_label.pack(expand=True, fill="both", padx=20, pady=20)
-        # --- END REPLACEMENT ---
+        self.excel_frame.bind("<Configure>", self._resize_excel_window)
 
         info_frame = ttk.Frame(main_pane, padding=10)
         info_frame.columnconfigure(0, weight=1)
@@ -337,6 +358,146 @@ class LeanDigitalTwin(tk.Tk):
         self.datasheets_display = tk.Listbox(view_frame, height=5, exportselection=False)
         self.datasheets_display.grid(row=3, column=1, sticky="nsew", padx=(5, 5), pady=5)
         self.datasheets_display.bind("<Double-1>", lambda event: self._load_datasheet_from_functionalities_tab(event))
+
+    def _resize_excel_window(self, event=None):
+        if self.xl_app and hasattr(self.xl_app, 'hwnd') and self.xl_app.hwnd:
+            try:
+                win32gui.MoveWindow(self.xl_app.hwnd, 0, 0, self.excel_frame.winfo_width(),
+                                    self.excel_frame.winfo_height(), True)
+            except (win32gui.error, AttributeError):
+                # If we can't resize, the Excel window might be gone
+                pass
+
+    def _load_excel_file(self, file_path):
+        try:
+            abs_path = os.path.abspath(file_path)
+            if not os.path.exists(abs_path):
+                messagebox.showerror("File Not Found", f"The file could not be found at:\n{abs_path}")
+                return
+
+            # Clean up any existing Excel instance first
+            if self.xl_app is not None:
+                self._cleanup_xlwings()
+
+            # Create Excel app with visible=True first
+            self.xl_app = xw.App(visible=True, add_book=False)
+            self.xl_app.display_alerts = False
+            
+            # Small delay to ensure Excel is fully loaded
+            self.after(200, lambda: self._continue_excel_loading(abs_path))
+
+        except Exception as e:
+            messagebox.showerror("xlwings Load Error",
+                                 f"Failed to initialize Excel.\n\nError: {e}")
+            self._cleanup_xlwings()
+            self.current_xl_db = None
+            self.sheet_selector_combobox['values'] = []
+            self.sheet_selector_combobox.set('')
+
+    def _continue_excel_loading(self, abs_path):
+        try:
+            # Open the workbook
+            self.current_xl_db = self.xl_app.books.open(abs_path)
+            
+            # Get Excel window handle
+            excel_hwnd = None
+            max_attempts = 10
+            attempt = 0
+            
+            # Try to get the Excel window handle with retries
+            while excel_hwnd is None and attempt < max_attempts:
+                try:
+                    excel_hwnd = self.xl_app.hwnd
+                    if excel_hwnd:
+                        break
+                except:
+                    pass
+                attempt += 1
+                self.after(100)  # Wait 100ms before retry
+            
+            if not excel_hwnd:
+                raise Exception("Could not get Excel window handle after multiple attempts")
+            
+            # Get the frame to embed into
+            self.excel_frame.update_idletasks()  # Ensure frame is rendered
+            frame_hwnd = self.excel_frame.winfo_id()
+            
+            # Embed Excel window into our frame
+            win32gui.SetParent(excel_hwnd, frame_hwnd)
+
+            # Remove window decorations (title bar, borders)
+            style = win32gui.GetWindowLong(excel_hwnd, win32con.GWL_STYLE)
+            style &= ~(win32con.WS_CAPTION | win32con.WS_THICKFRAME | win32con.WS_SYSMENU)
+            win32gui.SetWindowLong(excel_hwnd, win32con.GWL_STYLE, style)
+
+            # Activate the workbook and resize the window
+            self.current_xl_db.activate()
+            self.after(100, self._resize_excel_window)  # Delay resize to ensure embedding is complete
+
+            # Update sheet selector
+            sheet_names = [sheet.name for sheet in self.current_xl_db.sheets]
+            self.sheet_selector_combobox['values'] = sheet_names
+            if sheet_names:
+                self.sheet_selector_combobox.set(sheet_names[0])
+                self._display_sheet(sheet_names[0])
+
+            self.current_excel_path = abs_path
+            self._update_status(f"Embedded '{os.path.basename(abs_path)}'.", 4000)
+
+        except Exception as e:
+            messagebox.showerror("xlwings Embed Error",
+                                 f"Failed to open or embed the Excel file.\n\nError: {e}")
+            self._cleanup_xlwings()
+            self.current_xl_db = None
+            self.sheet_selector_combobox['values'] = []
+            self.sheet_selector_combobox.set('')
+
+    def _on_sheet_selected(self, event=None):
+        selected_sheet = self.sheet_selector_combobox.get()
+        if selected_sheet:
+            self._display_sheet(selected_sheet)
+
+    def _display_sheet(self, sheet_name):
+        if not self.current_xl_db:
+            return
+        try:
+            self.current_xl_db.sheets[sheet_name].activate()
+            self._update_status(f"Activated sheet '{sheet_name}'.", 3000)
+        except Exception as e:
+            messagebox.showerror("Sheet Activation Error", f"Could not activate sheet '{sheet_name}'.\n\nError: {e}")
+
+    def _paste_from_clipboard(self):
+        if not self.current_xl_db:
+            messagebox.showwarning("No Datasheet", "Please open and embed a datasheet first.")
+            return
+
+        cell_address = self.paste_cell_entry.get().strip().upper()
+        if not re.match(r"^[A-Z]+[1-9][0-9]*$", cell_address):
+            messagebox.showwarning("Invalid Cell", "Please enter a valid cell address (e.g., A1, B5, C10).")
+            return
+
+        try:
+            clipboard_content = self.clipboard_get()
+            sheet = self.current_xl_db.sheets.active
+
+            target_cell = sheet.range(cell_address)
+
+            # Handle merged cells properly
+            if hasattr(target_cell, 'merge_area') and target_cell.merge_area:
+                write_cell = target_cell.merge_area.cells[0]
+            else:
+                write_cell = target_cell
+
+            write_cell.value = clipboard_content
+            self.current_xl_db.save()
+
+            self._update_status(f"Pasted to {write_cell.address.replace('$', '')} in '{sheet.name}' and saved.", 4000)
+            self.paste_cell_entry.delete(0, tk.END)
+
+        except tk.TclError:
+            messagebox.showwarning("Empty Clipboard", "The clipboard is empty or contains no text.")
+        except Exception as e:
+            messagebox.showerror("Paste Error", f"An error occurred while pasting to Excel: {e}")
 
     def _update_data_model(self, event=None):
         selected_indices = self.node_listbox_display.curselection()
@@ -494,74 +655,6 @@ class LeanDigitalTwin(tk.Tk):
             messagebox.showinfo("Import Successful", f"{imported_count} new datasheet(s) added to the library.")
             self._update_status("Datasheet library updated.", 4000)
 
-    def _load_excel_file(self, file_path):
-        try:
-            abs_path = os.path.abspath(file_path)
-            if not os.path.exists(abs_path):
-                messagebox.showerror("File Not Found", f"The file could not be found at:\n{abs_path}")
-                return
-
-            # Start Excel if it's not running, or connect to the existing instance
-            if self.xl_app is None:
-                # Create Excel app with add_book=False to prevent Book1 from opening
-                self.xl_app = xw.App(visible=True, add_book=False)
-                self.xl_app.display_alerts = False  # Suppress Excel alerts
-                self.xl_app.activate()  # Bring excel to front
-
-            # Close any existing workbook first
-            if self.current_xl_db:
-                try:
-                    self.current_xl_db.close()
-                except:
-                    pass
-                self.current_xl_db = None
-
-            # Close any unwanted Book1 that might have opened
-            try:
-                for book in self.xl_app.books:
-                    if book.name.startswith("Book") and len(book.sheets) == 1 and book.sheets[0].name == "Sheet1":
-                        # Check if it's an empty workbook
-                        if book.sheets[0].used_range is None:
-                            book.close()
-            except:
-                pass
-
-            # Open the workbook
-            self.current_xl_db = self.xl_app.books.open(abs_path)
-            self.current_xl_db.activate()  # Make sure our workbook is active
-            
-            sheet_names = [sheet.name for sheet in self.current_xl_db.sheets]
-
-            self.sheet_selector_combobox['values'] = sheet_names
-            if sheet_names:
-                self.sheet_selector_combobox.set(sheet_names[0])
-                self._display_sheet(sheet_names[0])
-
-            self.current_excel_path = abs_path
-            self._update_status(f"Opened '{os.path.basename(file_path)}' in Excel.", 4000)
-
-        except Exception as e:
-            messagebox.showerror("xlwings Load Error",
-                                 f"Failed to open the Excel file. Is Excel installed?\n\nError: {e}")
-            self.current_xl_db = None
-            self.sheet_selector_combobox['values'] = []
-            self.sheet_selector_combobox.set('')
-
-    def _on_sheet_selected(self, event=None):
-        selected_sheet = self.sheet_selector_combobox.get()
-        if selected_sheet:
-            self._display_sheet(selected_sheet)
-
-    def _display_sheet(self, sheet_name):
-        """Activates the specified sheet in the open Excel workbook."""
-        if not self.current_xl_db:
-            return
-        try:
-            self.current_xl_db.sheets[sheet_name].activate()
-            self._update_status(f"Activated sheet '{sheet_name}'.", 3000)
-        except Exception as e:
-            messagebox.showerror("Sheet Activation Error", f"Could not activate sheet '{sheet_name}'.\n\nError: {e}")
-
     def _save_excel_as(self):
         if not self.current_excel_path or not self.current_xl_db:
             messagebox.showwarning("No File", "A datasheet must be open in Excel to use 'Save As'.")
@@ -577,7 +670,6 @@ class LeanDigitalTwin(tk.Tk):
             filename = os.path.basename(abs_save_path)
             internal_path = os.path.join(self.storage_dir, filename)
 
-            # Ensure a copy is in the library
             if os.path.normpath(abs_save_path).lower() != os.path.normpath(internal_path).lower():
                 shutil.copyfile(abs_save_path, internal_path)
 
@@ -591,9 +683,12 @@ class LeanDigitalTwin(tk.Tk):
         if not event.widget.curselection(): return
         file_name = event.widget.get(event.widget.curselection())
 
-        # If the selected file is already open, just activate it. Otherwise, load it.
         if self.current_xl_db and self.current_xl_db.name == file_name:
-            self.current_xl_db.activate()
+            try:
+                self.current_xl_db.activate()
+            except:
+                # If activation fails, reload the file
+                self._load_excel_file(os.path.join(self.storage_dir, file_name))
         else:
             self._load_excel_file(os.path.join(self.storage_dir, file_name))
 
@@ -723,7 +818,6 @@ class LeanDigitalTwin(tk.Tk):
             return
         file_name = self.file_listbox_manage.get(self.file_listbox_manage.curselection())
 
-        # If the file to be removed is currently open, close it first.
         if self.current_xl_db and self.current_xl_db.name == file_name:
             self.current_xl_db.close()
             self.current_xl_db = None
@@ -805,45 +899,12 @@ class LeanDigitalTwin(tk.Tk):
         self.clipboard_append(str(value_to_copy))
         self._update_status(f"'{value_to_copy}' copied to clipboard.", 3000)
 
-    def _paste_from_clipboard(self):
-        if not self.current_xl_db:
-            messagebox.showwarning("No Datasheet", "Please open a datasheet in Excel first.")
-            return
-
-        cell_address = self.paste_cell_entry.get().strip().upper()
-        if not re.match(r"^[A-Z]+[1-9][0-9]*$", cell_address):
-            messagebox.showwarning("Invalid Cell", "Please enter a valid cell address (e.g., A1, B5, C10).")
-            return
-
-        try:
-            clipboard_content = self.clipboard_get()
-
-            # Get the active sheet from the Excel workbook
-            sheet = self.current_xl_db.sheets.active
-
-            # Write the value to the cell and save the workbook
-            sheet.range(cell_address).value = clipboard_content
-            self.current_xl_db.save()
-
-            self._update_status(f"Pasted to {cell_address} in '{sheet.name}' and saved.", 4000)
-            self.paste_cell_entry.delete(0, tk.END)
-
-        except tk.TclError:
-            messagebox.showwarning("Empty Clipboard", "The clipboard is empty or contains no text.")
-        except Exception as e:
-            messagebox.showerror("Paste Error", f"An error occurred while pasting to Excel: {e}")
-
 
 if __name__ == "__main__":
-    # Check if Excel is installed before launching
-    try:
-        # This will raise an exception if it can't find a running instance or start a new one
-        app_check = xw.App(visible=False)
-        app_check.quit()
+    # Create the application instance
+    app = LeanDigitalTwin()
 
-        app = LeanDigitalTwin()
+    # Only run the main event loop if the initialization was successful.
+    # If it failed, the error message has already been shown.
+    if app.initialization_ok:
         app.mainloop()
-    except Exception as e:
-        messagebox.showerror("Excel Not Found",
-                             "Could not connect to Microsoft Excel. Please ensure it is installed.\n\n"
-                             f"Error: {e}")
