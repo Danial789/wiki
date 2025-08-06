@@ -3,45 +3,61 @@ import shutil
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import re
 
 # --- STABLE DEPENDENCIES ---
-import pandas as pd
-from pandastable import Table
-
+import xlwings as xw  # Replaced previous library with xlwings
 import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from SPARQLWrapper import SPARQLWrapper, JSON
 
+
 class LeanDigitalTwin(tk.Tk):
     """
     An application for interacting with a GraphDB repository, visualizing data models,
     and linking data to Excel datasheets, creating a "Lean Digital Twin."
-    [VERSION: PANDASTABLE with Sheet Selection]
+    [VERSION: XLWINGS - Live Excel Automation]
     """
 
     def __init__(self):
         super().__init__()
-        self.title("LEAN Digital Twin")
+        self.title("LEAN Digital Twin (xlwings Edition)")
         self.geometry("1400x800")
 
         self.properties = []
         self.current_excel_path = None
         self.tag_associations = {}
         self.graph = nx.DiGraph()
-        self.pt_table = None
-        self.current_workbook = None
+        self.xl_app = None  # To hold the xlwings App instance
+        self.current_xl_db = None  # This will be our xlwings.Book object
+        self.active_node = None
 
         self.storage_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "excel_files")
         os.makedirs(self.storage_dir, exist_ok=True)
 
         self._configure_styles()
         self._create_main_ui()
-        
+
         self.protocol("WM_DELETE_WINDOW", self.destroy)
-        
+
         self.after(100, self._update_file_lists)
         self.after(100, self._update_tag_lists)
+
+    def destroy(self):
+        """Custom destroy method to ensure Excel quits."""
+        self._cleanup_xlwings()
+        super().destroy()
+
+    def _cleanup_xlwings(self):
+        """Closes the Excel instance started by this application."""
+        if self.xl_app:
+            try:
+                self.xl_app.quit()
+                self.xl_app = None
+                self._update_status("Excel instance closed.", 2000)
+            except Exception as e:
+                print(f"Could not quit Excel: {e}")
 
     def _configure_styles(self):
         self.style = ttk.Style(self)
@@ -52,29 +68,30 @@ class LeanDigitalTwin(tk.Tk):
         self.style.configure('TNotebook.Tab', font=('Segoe UI', 10, 'bold'), padding=[10, 5])
         self.style.configure('Header.TLabel', font=('Segoe UI', 12, 'bold'))
         self.style.configure('Info.TLabel', font=('Segoe UI', 9, 'italic'))
+        self.style.configure('ActiveNode.TLabel', font=('Segoe UI', 11, 'bold'), foreground='blue')
 
     def _create_main_ui(self):
         main_frame = ttk.Frame(self, padding="10")
         main_frame.pack(expand=True, fill="both")
-        
+
         self.main_notebook = ttk.Notebook(main_frame)
         self.main_notebook.pack(expand=True, fill="both")
-        
+
         self.tab_graphical = ttk.Frame(self.main_notebook, padding=10)
         self.tab_graphdb = ttk.Frame(self.main_notebook, padding=10)
         self.tab_excel = ttk.Frame(self.main_notebook, padding=10)
         self.tab_functionalities = ttk.Frame(self.main_notebook, padding=10)
-        
+
         self.main_notebook.add(self.tab_graphical, text="Graphical Model")
         self.main_notebook.add(self.tab_graphdb, text="GraphDB → Excel")
-        self.main_notebook.add(self.tab_excel, text="Datasheet Editor")
+        self.main_notebook.add(self.tab_excel, text="Datasheet Viewer")
         self.main_notebook.add(self.tab_functionalities, text="Functionalities")
-        
+
         self._build_graphical_model_tab(self.tab_graphical)
         self._build_graphdb_tab(self.tab_graphdb)
         self._build_datasheet_editor_tab(self.tab_excel)
         self._build_functionalities_tab(self.tab_functionalities)
-        
+
         self.status_bar = ttk.Label(self, text="Ready", relief=tk.SUNKEN, anchor='w', padding=5)
         self.status_bar.pack(side="bottom", fill="x")
 
@@ -86,349 +103,311 @@ class LeanDigitalTwin(tk.Tk):
     def _build_graphical_model_tab(self, parent):
         parent.rowconfigure(1, weight=1)
         parent.columnconfigure(0, weight=1)
-        
+
         controls_frame = ttk.Frame(parent)
         controls_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        
+
         ttk.Label(controls_frame, text="Select Node(s) to Visualize:", style='Header.TLabel').pack(anchor="w")
-        
+
         self.node_listbox_display = tk.Listbox(controls_frame, height=6, selectmode="extended", exportselection=False)
         self.node_listbox_display.pack(fill="x", expand=True, pady=5)
         self.node_listbox_display.bind("<<ListboxSelect>>", lambda event: self._update_data_model(event))
-        
+
         button_bar = ttk.Frame(controls_frame)
         button_bar.pack(fill="x", pady=5)
-        
+
         ttk.Button(button_bar, text="Refresh Model", command=self._update_data_model).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(button_bar, text="Clear Graph", command=self._clear_graph).pack(side=tk.LEFT)
-        
+
         self.graph_frame = ttk.Frame(parent, relief=tk.SUNKEN, borderwidth=1)
         self.graph_frame.grid(row=1, column=0, sticky="nsew")
 
     def _build_graphdb_tab(self, parent):
-        parent.columnconfigure(1, weight=1)
-        
-        conn_frame = ttk.LabelFrame(parent, text="1. Connection & Node Selection", padding=10)
-        conn_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        conn_frame = ttk.LabelFrame(parent, text="1. Connection", padding=10)
+        conn_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         conn_frame.columnconfigure(1, weight=1)
-        
+
         ttk.Label(conn_frame, text="Repo URL:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
         self.entry_repo = ttk.Entry(conn_frame)
-        self.entry_repo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=5, pady=2)
-        
+        self.entry_repo.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+
         ttk.Label(conn_frame, text="SPARQL Prefix:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
         self.entry_prefix = ttk.Entry(conn_frame)
         self.entry_prefix.insert(0, "PREFIX ex: <http://example.org/pumps#>")
-        self.entry_prefix.grid(row=1, column=1, columnspan=2, sticky="ew", padx=5, pady=2)
-        
-        ttk.Button(conn_frame, text="Fetch All Nodes from Repo", command=self._fetch_nodes).grid(row=2, column=1, sticky="w", padx=5, pady=10)
-        
-        self.node_listbox = tk.Listbox(conn_frame, height=6, exportselection=False)
-        self.node_listbox.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
-        self.node_listbox.bind("<Double-1>", lambda event: self._select_and_fetch_properties(event))
-        conn_frame.rowconfigure(3, weight=1)
-        
-        prop_frame = ttk.LabelFrame(parent, text="2. Property Mapping", padding=10)
-        prop_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=10)
-        prop_frame.columnconfigure(1, weight=1)
-        
-        ttk.Label(prop_frame, text="Properties for selected node (Double-click to add):").grid(row=0, column=0, columnspan=2, sticky="w", padx=5)
-        self.prop_listbox_selected = tk.Listbox(prop_frame, height=5, exportselection=False)
-        self.prop_listbox_selected.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
-        self.prop_listbox_selected.bind("<Double-1>", lambda event: self._select_property(event))
-        
-        ttk.Separator(prop_frame, orient='horizontal').grid(row=2, column=0, columnspan=2, sticky='ew', pady=10)
-        
-        ttk.Label(prop_frame, text="Property:").grid(row=3, column=0, sticky="w", padx=5, pady=2)
-        self.entry_prop = ttk.Entry(prop_frame)
-        self.entry_prop.grid(row=3, column=1, sticky="ew", padx=5, pady=2)
-        
-        ttk.Label(prop_frame, text="Value Cell (e.g., B2):").grid(row=4, column=0, sticky="w", padx=5, pady=2)
-        self.entry_val = ttk.Entry(prop_frame)
-        self.entry_val.grid(row=4, column=1, sticky="ew", padx=5, pady=2)
-        
-        ttk.Label(prop_frame, text="Unit Cell (optional):").grid(row=5, column=0, sticky="w", padx=5, pady=2)
-        self.entry_unit = ttk.Entry(prop_frame)
-        self.entry_unit.grid(row=5, column=1, sticky="ew", padx=5, pady=2)
-        
-        ttk.Button(prop_frame, text="Add Property Mapping", command=self._add_property).grid(row=6, column=1, sticky="w", padx=5, pady=10)
-        
-        self.prop_listbox = tk.Listbox(prop_frame, height=5)
-        self.prop_listbox.grid(row=7, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
-        
-        out_frame = ttk.LabelFrame(parent, text="3. Excel Output", padding=10)
-        out_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        out_frame.columnconfigure(1, weight=1)
-        
-        ttk.Label(out_frame, text="Target Datasheet:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
-        self.entry_xlsx = ttk.Entry(out_frame, state='readonly')
-        self.entry_xlsx.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
-        
-        ttk.Button(out_frame, text="Select from Library…", command=self._browse_xlsx_from_library).grid(row=0, column=2, padx=5)
-        
-        ttk.Label(out_frame, text="Sheet Name:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
-        self.entry_sheet = ttk.Entry(out_frame)
-        self.entry_sheet.insert(0, "Sheet1")
-        self.entry_sheet.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
-        
-        ttk.Button(out_frame, text="Write to Excel", command=self._write_to_excel).grid(row=2, column=1, sticky="w", padx=5, pady=10)
+        self.entry_prefix.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+
+        node_select_frame = ttk.LabelFrame(parent,
+                                           text="2. Master Node List (Double-click to set Active Node manually)",
+                                           padding=10)
+        node_select_frame.grid(row=1, column=0, sticky="nsew", pady=10)
+        node_select_frame.rowconfigure(1, weight=1)
+        node_select_frame.columnconfigure(0, weight=1)
+
+        ttk.Button(node_select_frame, text="Fetch All Nodes from Repo", command=self._fetch_nodes).grid(row=0, column=0,
+                                                                                                        sticky="w",
+                                                                                                        padx=5, pady=5)
+        self.node_listbox = tk.Listbox(node_select_frame, height=6, exportselection=False)
+        self.node_listbox.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        self.node_listbox.bind("<Double-1>", lambda event: self._on_node_manual_select(event))
 
     def _build_datasheet_editor_tab(self, parent):
         parent.rowconfigure(1, weight=1)
         parent.columnconfigure(1, weight=1)
-        
+
         left_pane = ttk.Frame(parent, padding=5)
         left_pane.grid(row=0, column=0, rowspan=2, sticky="ns", pady=5)
         left_pane.rowconfigure(3, weight=1)
-        
-        ttk.Label(left_pane, text="Select a Tag to View:", style='Header.TLabel').grid(row=0, column=0, sticky="w", pady=(0, 5))
-        
+
+        ttk.Label(left_pane, text="Select a Tag to View:", style='Header.TLabel').grid(row=0, column=0, sticky="w",
+                                                                                       pady=(0, 5))
+
         self.tag_selector_combobox = ttk.Combobox(left_pane, state="readonly")
         self.tag_selector_combobox.grid(row=1, column=0, sticky="ew")
-        self.tag_selector_combobox.bind("<<ComboboxSelected>>", lambda event: self._on_tag_selected_in_editor_tab(event))
-        
-        ttk.Label(left_pane, text="Datasheets for Selected Tag:", style='Header.TLabel').grid(row=2, column=0, sticky="w", pady=(10, 5))
-        
+        self.tag_selector_combobox.bind("<<ComboboxSelected>>",
+                                        lambda event: self._on_tag_selected_in_editor_tab(event))
+
+        ttk.Label(left_pane, text="Datasheets for Selected Tag:", style='Header.TLabel').grid(row=2, column=0,
+                                                                                              sticky="w", pady=(10, 5))
+
         self.datasheet_listbox_for_tag = tk.Listbox(left_pane, height=15, exportselection=False)
         self.datasheet_listbox_for_tag.grid(row=3, column=0, sticky="nsew")
         self.datasheet_listbox_for_tag.bind("<Double-1>", lambda event: self._load_file_from_list(event))
-        
+
         main_pane = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
         main_pane.grid(row=1, column=1, sticky="nsew", padx=10, pady=5)
-        
+
         table_container = ttk.Frame(main_pane)
         main_pane.add(table_container, weight=3)
         table_container.rowconfigure(1, weight=1)
         table_container.columnconfigure(0, weight=1)
-        
+
         sheet_controls_frame = ttk.Frame(table_container)
         sheet_controls_frame.grid(row=0, column=0, sticky="ew", pady=(0, 5))
-        
-        ttk.Label(sheet_controls_frame, text="Select Sheet:").pack(side=tk.LEFT, padx=(0, 5))
-        
+
+        ttk.Label(sheet_controls_frame, text="Activate Sheet in Excel:").pack(side=tk.LEFT, padx=(0, 5))
+
         self.sheet_selector_combobox = ttk.Combobox(sheet_controls_frame, state="readonly")
         self.sheet_selector_combobox.pack(side=tk.LEFT, fill="x", expand=True)
         self.sheet_selector_combobox.bind("<<ComboboxSelected>>", lambda event: self._on_sheet_selected(event))
-        
+
+        # --- REPLACEMENT FOR EMBEDDED VIEWER ---
         self.excel_frame = ttk.Frame(table_container, relief=tk.SUNKEN, borderwidth=1)
         self.excel_frame.grid(row=1, column=0, sticky="nsew")
-        
+
+        info_label = ttk.Label(self.excel_frame,
+                               text="\n\nExcel file will be opened in a separate window.\n\n"
+                                    "Use the dropdown above to switch between sheets in the active Excel file.",
+                               font=('Segoe UI', 11, 'italic'),
+                               justify=tk.CENTER,
+                               anchor=tk.CENTER)
+        info_label.pack(expand=True, fill="both", padx=20, pady=20)
+        # --- END REPLACEMENT ---
+
         info_frame = ttk.Frame(main_pane, padding=10)
         info_frame.columnconfigure(0, weight=1)
         main_pane.add(info_frame, weight=1)
-        
-        ttk.Label(info_frame, text="Tag Information", style='Header.TLabel').grid(row=0, column=0, sticky="w", pady=(0, 5))
-        
-        self.tag_text_embed = tk.Text(info_frame, height=5, width=30, font=('Segoe UI', 10), relief=tk.SOLID, borderwidth=1)
+
+        ttk.Label(info_frame, text="Tag Information", style='Header.TLabel').grid(row=0, column=0, sticky="w",
+                                                                                  pady=(0, 5))
+        self.tag_text_embed = tk.Text(info_frame, height=4, width=30, font=('Segoe UI', 10), relief=tk.SOLID,
+                                      borderwidth=1, state='disabled')
         self.tag_text_embed.grid(row=1, column=0, sticky="ew")
-        
-        ttk.Label(info_frame, text="Associated Node Properties:", style='Header.TLabel').grid(row=2, column=0, sticky="w", pady=(10, 5))
-        
-        self.properties_text_embed = tk.Text(info_frame, height=15, width=30, font=('Segoe UI', 10), relief=tk.SOLID, borderwidth=1)
-        self.properties_text_embed.grid(row=3, column=0, sticky="nsew")
-        info_frame.rowconfigure(3, weight=1)
-        
+
+        active_node_frame = ttk.LabelFrame(info_frame, text="Active Node for Mapping", padding=10)
+        active_node_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.active_node_display_label = ttk.Label(active_node_frame, text="None Selected", style='ActiveNode.TLabel')
+        self.active_node_display_label.pack(pady=2)
+
+        ttk.Label(info_frame, text="Associated Node Properties (Double-click to preview):", style='Header.TLabel').grid(
+            row=3, column=0, sticky="w", pady=(10, 5))
+        self.properties_text_embed = tk.Text(info_frame, height=8, width=30, font=('Segoe UI', 10), relief=tk.SOLID,
+                                             borderwidth=1, state='disabled')
+        self.properties_text_embed.grid(row=4, column=0, sticky="nsew")
+        self.properties_text_embed.bind("<Double-1>", self._on_property_double_click)
+
+        paste_frame = ttk.LabelFrame(info_frame, text="Copy/Paste Live Data", padding=10)
+        paste_frame.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
+        paste_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(paste_frame, text="1. Double-click property to copy.", style='Info.TLabel').grid(row=0, column=0,
+                                                                                                   columnspan=2,
+                                                                                                   sticky="w")
+        ttk.Label(paste_frame, text="2. Type target cell (e.g., B5).", style='Info.TLabel').grid(row=1, column=0,
+                                                                                                 columnspan=2,
+                                                                                                 sticky="w")
+        ttk.Label(paste_frame, text="3. Click Paste.", style='Info.TLabel').grid(row=2, column=0, columnspan=2,
+                                                                                 sticky="w")
+
+        self.live_value_button = ttk.Button(paste_frame, text="Copy Value: (none)")
+        self.live_value_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 5))
+        self.live_unit_button = ttk.Button(paste_frame, text="Copy Unit: (none)")
+        self.live_unit_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=5)
+
+        ttk.Label(paste_frame, text="Cell:").grid(row=5, column=0, sticky="w", padx=(0, 5), pady=5)
+        self.paste_cell_entry = ttk.Entry(paste_frame, width=10)
+        self.paste_cell_entry.grid(row=5, column=1, sticky="ew", pady=5)
+
+        self.paste_button = ttk.Button(paste_frame, text="Paste to Active Excel Sheet",
+                                       command=self._paste_from_clipboard)
+        self.paste_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=5)
+
         button_frame = ttk.Frame(parent)
         button_frame.grid(row=2, column=1, sticky="ew", pady=(10, 0), padx=10)
-        
-        ttk.Button(button_frame, text="Import Datasheet to Library...", command=self._import_datasheet_to_library).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(button_frame, text="Save Current Datasheet", command=self._save_excel).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Save As...", command=self._save_excel_as).pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(button_frame, text="Import Datasheet to Library...", command=self._import_datasheet_to_library).pack(
+            side=tk.LEFT, padx=(0, 5))
+        ttk.Button(button_frame, text="Save As (Make a Copy)...", command=self._save_excel_as).pack(side=tk.LEFT,
+                                                                                                    padx=5)
 
     def _build_functionalities_tab(self, parent):
         parent.rowconfigure(0, weight=1)
         parent.columnconfigure(0, weight=1)
-        
+
         sub_notebook = ttk.Notebook(parent)
         sub_notebook.grid(row=0, column=0, sticky="nsew")
-        
+
         frame_tags = ttk.Frame(sub_notebook, padding=10)
         frame_excel_files = ttk.Frame(sub_notebook, padding=10)
-        
+
         sub_notebook.add(frame_tags, text="Tag Management")
         sub_notebook.add(frame_excel_files, text="File Management")
-        
+
         self._build_tags_subtab(frame_tags)
         self._build_excel_files_subtab(frame_excel_files)
-        
+
     def _build_excel_files_subtab(self, parent):
         parent.rowconfigure(2, weight=1)
         parent.columnconfigure(0, weight=1)
-        
-        ttk.Label(parent, text="Datasheet Library", style='Header.TLabel').grid(row=0, column=0, sticky="w", pady=(0, 5))
-        ttk.Label(parent, text="This list contains all datasheets imported into the application's library.", style='Info.TLabel').grid(row=1, column=0, sticky="w", pady=(0, 10))
-        
+
+        ttk.Label(parent, text="Datasheet Library", style='Header.TLabel').grid(row=0, column=0, sticky="w",
+                                                                                pady=(0, 5))
+        ttk.Label(parent, text="This list contains all datasheets imported into the application's library.",
+                  style='Info.TLabel').grid(row=1, column=0, sticky="w", pady=(0, 10))
+
         self.file_listbox_manage = tk.Listbox(parent, height=10)
         self.file_listbox_manage.grid(row=2, column=0, sticky="nsew", pady=5)
-        
-        ttk.Button(parent, text="Remove Selected File from Library", command=self._remove_file).grid(row=3, column=0, sticky="w", pady=10)
+
+        ttk.Button(parent, text="Remove Selected File from Library", command=self._remove_file).grid(row=3, column=0,
+                                                                                                     sticky="w",
+                                                                                                     pady=10)
 
     def _build_tags_subtab(self, parent):
         parent.columnconfigure(1, weight=1)
         parent.rowconfigure(1, weight=1)
-        
+
         create_frame = ttk.LabelFrame(parent, text="Create or Update Tag", padding=10)
         create_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         create_frame.columnconfigure(1, weight=1)
-        
+
         ttk.Label(create_frame, text="Tag Name:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
         self.entry_tag = ttk.Entry(create_frame)
         self.entry_tag.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
-        
+
         ttk.Label(create_frame, text="Associate Node(s):").grid(row=1, column=0, sticky="w", padx=5, pady=2)
         self.node_combobox = ttk.Combobox(create_frame, state="readonly")
         self.node_combobox.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
-        
+
         ttk.Label(create_frame, text="Associate Datasheet(s):").grid(row=2, column=0, sticky="w", padx=5, pady=2)
         self.datasheet_combobox = ttk.Combobox(create_frame, state="readonly")
         self.datasheet_combobox.grid(row=2, column=1, sticky="ew", padx=5, pady=2)
-        
-        ttk.Button(create_frame, text="Create/Update Tag", command=self._add_tag).grid(row=3, column=1, sticky="e", padx=5, pady=10)
-        
+
+        ttk.Button(create_frame, text="Create/Update Tag", command=self._add_tag).grid(row=3, column=1, sticky="e",
+                                                                                       padx=5, pady=10)
+
         view_frame = ttk.LabelFrame(parent, text="View Tag Associations", padding=10)
         view_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
         view_frame.columnconfigure(1, weight=1)
         view_frame.rowconfigure(1, weight=1)
-        
-        ttk.Label(view_frame, text="Existing Tags (Double-click to view)").grid(row=0, column=0, columnspan=2, sticky="w", padx=5)
+
+        ttk.Label(view_frame, text="Existing Tags (Double-click to view)").grid(row=0, column=0, columnspan=2,
+                                                                                sticky="w", padx=5)
         self.tag_listbox = tk.Listbox(view_frame, height=5, exportselection=False)
         self.tag_listbox.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
         self.tag_listbox.bind("<Double-1>", lambda event: self._show_tag_connections(event))
-        
-        ttk.Label(view_frame, text="Associated Nodes").grid(row=2, column=0, sticky="w", padx=5, pady=(10,0))
+
+        ttk.Label(view_frame, text="Associated Nodes").grid(row=2, column=0, sticky="w", padx=5, pady=(10, 0))
         self.nodes_display = tk.Listbox(view_frame, height=5, exportselection=False)
         self.nodes_display.grid(row=3, column=0, sticky="nsew", padx=5, pady=5)
         view_frame.rowconfigure(3, weight=1)
-        
-        ttk.Label(view_frame, text="Associated Datasheets").grid(row=2, column=1, sticky="w", padx=5, pady=(10,0))
+
+        ttk.Label(view_frame, text="Associated Datasheets").grid(row=2, column=1, sticky="w", padx=5, pady=(10, 0))
         self.datasheets_display = tk.Listbox(view_frame, height=5, exportselection=False)
-        self.datasheets_display.grid(row=3, column=1, sticky="nsew", padx=(5,5), pady=5)
+        self.datasheets_display.grid(row=3, column=1, sticky="nsew", padx=(5, 5), pady=5)
         self.datasheets_display.bind("<Double-1>", lambda event: self._load_datasheet_from_functionalities_tab(event))
 
-    # --- MISSING METHODS - Added implementations ---
-    
     def _update_data_model(self, event=None):
-        """Update the graphical data model visualization"""
-        try:
-            # Clear existing visualization
-            for widget in self.graph_frame.winfo_children():
-                widget.destroy()
-            
-            # Get selected nodes
-            selected_indices = self.node_listbox_display.curselection()
-            if not selected_indices:
-                # If no nodes selected, show a message
-                label = ttk.Label(self.graph_frame, text="Select one or more nodes to visualize the data model.", 
-                                font=('Segoe UI', 12), foreground='gray')
-                label.pack(expand=True)
-                return
-            
-            selected_nodes = [self.node_listbox_display.get(i) for i in selected_indices]
-            
-            # Create a new graph
+        selected_indices = self.node_listbox_display.curselection()
+        if not selected_indices: return
+
+        nodes = [self.node_listbox_display.get(i) for i in selected_indices]
+        repo_url, prefix = self.entry_repo.get().strip(), self.entry_prefix.get().strip()
+
+        if not all([repo_url, prefix, nodes]):
+            messagebox.showwarning("Missing Data", "Repository URL, Prefix, and a selected node are required.")
+            return
+
+        self._clear_graph()
+        self._update_status("Fetching data model...")
+
+        def get_local_name(uri):
+            if not isinstance(uri, str): return uri
+            return uri.split('#')[-1].split('/')[-1]
+
+        def task():
+            node_conditions = " || ".join(
+                [f"sameTerm(?subject, ex:{node}) || sameTerm(?object, ex:{node})" for node in nodes])
+            query = f"{prefix}\nSELECT ?subject ?predicate ?object WHERE {{ ?subject ?predicate ?object . FILTER({node_conditions}) }}"
+            results = self._run_sparql_query(query)
+            if results is None: return
+
             self.graph.clear()
-            
-            # Add nodes and query for relationships
-            prefix = self.entry_prefix.get().strip()
-            if prefix:
-                self._fetch_graph_relationships(selected_nodes, prefix)
-            
-            # Create matplotlib figure
-            fig, ax = plt.subplots(figsize=(8, 6))
-            fig.patch.set_facecolor('white')
-            
-            if self.graph.nodes():
-                pos = nx.spring_layout(self.graph, k=2, iterations=50)
-                
-                # Draw nodes
-                nx.draw_networkx_nodes(self.graph, pos, ax=ax, 
-                                     node_color='lightblue', 
-                                     node_size=1000, 
-                                     alpha=0.8)
-                
-                # Draw edges
-                nx.draw_networkx_edges(self.graph, pos, ax=ax, 
-                                     edge_color='gray', 
-                                     arrows=True, 
-                                     arrowsize=20,
-                                     alpha=0.6)
-                
-                # Draw labels
-                nx.draw_networkx_labels(self.graph, pos, ax=ax, 
-                                      font_size=8, 
-                                      font_weight='bold')
-                
-                ax.set_title(f"Data Model for: {', '.join(selected_nodes)}", 
-                           fontsize=12, fontweight='bold')
-            else:
-                ax.text(0.5, 0.5, 'No relationships found for selected nodes', 
-                       ha='center', va='center', transform=ax.transAxes, 
-                       fontsize=12, color='gray')
-                ax.set_title("Data Model Visualization", fontsize=12, fontweight='bold')
-            
-            ax.axis('off')
-            
-            # Embed in tkinter
-            canvas = FigureCanvasTkAgg(fig, self.graph_frame)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-            
-            self._update_status(f"Model updated for {len(selected_nodes)} node(s).", 4000)
-            
-        except Exception as e:
-            messagebox.showerror("Visualization Error", f"Failed to update data model: {e}")
-    
-    def _fetch_graph_relationships(self, nodes, prefix):
-        """Fetch relationships between nodes for visualization"""
-        try:
-            for node in nodes:
-                self.graph.add_node(node)
-                
-                # Query for outgoing relationships
-                query = f"{prefix}\nSELECT DISTINCT ?predicate ?object WHERE {{ ex:{node} ?predicate ?object . FILTER(!isBlank(?object) && ISIRI(?object)) }}"
-                results = self._run_sparql_query(query)
-                
-                if results:
-                    for result in results:
-                        obj_uri = result["object"]["value"]
-                        # Extract the local name from URI
-                        obj_name = obj_uri.split('#')[-1].split('/')[-1]
-                        pred_name = result["predicate"]["value"].split('#')[-1].split('/')[-1]
-                        
-                        if obj_name and obj_name != node:
-                            self.graph.add_edge(node, obj_name, label=pred_name)
-                
-                # Query for incoming relationships
-                query = f"{prefix}\nSELECT DISTINCT ?subject ?predicate WHERE {{ ?subject ?predicate ex:{node} . FILTER(!isBlank(?subject) && ISIRI(?subject)) }}"
-                results = self._run_sparql_query(query)
-                
-                if results:
-                    for result in results:
-                        subj_uri = result["subject"]["value"]
-                        subj_name = subj_uri.split('#')[-1].split('/')[-1]
-                        pred_name = result["predicate"]["value"].split('#')[-1].split('/')[-1]
-                        
-                        if subj_name and subj_name != node:
-                            self.graph.add_edge(subj_name, node, label=pred_name)
-                            
-        except Exception as e:
-            print(f"Error fetching graph relationships: {e}")
-    
-    def _clear_graph(self):
-        """Clear the graph visualization"""
+            for res in results:
+                subject = get_local_name(res.get("subject", {}).get("value", ""))
+                predicate = get_local_name(res.get("predicate", {}).get("value", ""))
+                obj = get_local_name(res.get("object", {}).get("value", ""))
+                if all([subject, predicate, obj]):
+                    self.graph.add_edge(subject, obj, label=predicate)
+
+            self.after(0, self._draw_graph)
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _draw_graph(self):
         for widget in self.graph_frame.winfo_children():
             widget.destroy()
-        
+
+        if not self.graph.nodes():
+            self._update_status("No data found for selected nodes.", 4000)
+            return
+
+        try:
+            fig, ax = plt.subplots(figsize=(10, 8))
+            pos = nx.spring_layout(self.graph, k=0.7, iterations=50)
+            nx.draw(self.graph, pos, ax=ax, with_labels=True, node_color='#a0cbe2', node_size=2500, font_size=10,
+                    font_weight='bold', width=1.5, edge_color='gray', arrows=True)
+            edge_labels = nx.get_edge_attributes(self.graph, 'label')
+            nx.draw_networkx_edge_labels(self.graph, pos, edge_labels=edge_labels, font_color='firebrick', font_size=9)
+            fig.tight_layout()
+
+            self.canvas = FigureCanvasTkAgg(fig, master=self.graph_frame)
+            self.canvas.draw()
+            self.canvas.get_tk_widget().pack(expand=True, fill="both")
+            self._update_status("Data model loaded.", 4000)
+            plt.close(fig)
+        except Exception as e:
+            messagebox.showerror("Graphing Error", f"An error occurred while drawing the graph: {e}")
+
+    def _clear_graph(self):
+        for widget in self.graph_frame.winfo_children():
+            widget.destroy()
         self.graph.clear()
-        
-        label = ttk.Label(self.graph_frame, text="Graph cleared. Select nodes to visualize.", 
-                         font=('Segoe UI', 12), foreground='gray')
-        label.pack(expand=True)
-        
-        self._update_status("Graph cleared.", 3000)
-    
-    # --- EXISTING METHODS ---
-    
+        if hasattr(self, 'canvas'):
+            del self.canvas
+        self._update_status("Graph cleared.")
+
     def _run_sparql_query(self, query):
         repo_url = self.entry_repo.get().strip()
         if not repo_url:
@@ -447,9 +426,11 @@ class LeanDigitalTwin(tk.Tk):
     def _fetch_nodes(self):
         prefix_str = self.entry_prefix.get().strip()
         if not prefix_str or '<' not in prefix_str or '>' not in prefix_str:
-            messagebox.showerror("Invalid Prefix", "Please provide a valid SPARQL Prefix (e.g., PREFIX ex: <http://example.org#>)")
+            messagebox.showerror("Invalid Prefix",
+                                 "Please provide a valid SPARQL Prefix (e.g., PREFIX ex: <http://example.org#>)")
             return
         self._update_status("Fetching all nodes from repository...")
+
         def task():
             try:
                 uri_base = prefix_str.split('<')[1].split('>')[0]
@@ -463,6 +444,7 @@ class LeanDigitalTwin(tk.Tk):
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("Error", f"Failed to parse prefix or fetch nodes: {e}"))
                 self.after(0, lambda: self._update_status("Error fetching nodes.", 4000))
+
         threading.Thread(target=task, daemon=True).start()
 
     def _update_node_lists(self, nodes):
@@ -473,119 +455,17 @@ class LeanDigitalTwin(tk.Tk):
             self.node_listbox_display.insert(tk.END, node)
         self.node_combobox['values'] = nodes
         self._update_status(f"{len(nodes)} nodes fetched.", 4000)
-        
-    def _select_and_fetch_properties(self, event=None):
-        if not self.node_listbox.curselection(): return
-        selected_node = self.node_listbox.get(self.node_listbox.curselection())
-        self._update_status(f"Fetching properties for {selected_node}...")
-        def task():
-            query = f"{self.entry_prefix.get().strip()}\nSELECT DISTINCT ?predicate WHERE {{ ex:{selected_node} ?predicate ?object . }}"
-            results = self._run_sparql_query(query)
-            if results is None: return
-            properties = sorted([p.split('#')[-1] for p in (res["predicate"]["value"] for res in results) if p.split('#')[-1] not in ["hasValue", "hasUnit", "a", "type"]])
-            self.after(0, self.prop_listbox_selected.delete(0, tk.END))
-            self.after(0, lambda: [self.prop_listbox_selected.insert(tk.END, p) for p in properties])
-            self.after(0, lambda: self._update_status(f"Properties for {selected_node} loaded.", 4000))
-        threading.Thread(target=task, daemon=True).start()
-
-    def _select_property(self, event=None):
-        if not self.prop_listbox_selected.curselection(): return
-        self.entry_prop.delete(0, tk.END)
-        self.entry_prop.insert(0, self.prop_listbox_selected.get(self.prop_listbox_selected.curselection()))
-        self.entry_val.focus_set()
-
-    def _add_property(self):
-        prop, val, unit = self.entry_prop.get().strip(), self.entry_val.get().strip().upper(), self.entry_unit.get().strip().upper()
-        if not prop or not val:
-            messagebox.showwarning("Input Required", "Property and Value Cell are required.")
-            return
-        self.properties.append((prop, val, unit))
-        self.prop_listbox.insert(tk.END, f"{prop} → Val: {val}, Unit: {unit or 'N/A'}")
-        for entry in [self.entry_prop, self.entry_val, self.entry_unit]:
-            entry.delete(0, tk.END)
-        self.entry_prop.focus_set()
-
-    def _browse_xlsx_from_library(self):
-        files = [f for f in os.listdir(self.storage_dir) if f.endswith(('.xlsx', '.xls'))]
-        if not files:
-            messagebox.showinfo("Library Empty", "No datasheets have been imported. Import one from the 'Datasheet Editor' tab first.")
-            return
-        top = tk.Toplevel(self)
-        top.title("Select Datasheet from Library")
-        top.geometry("300x250")
-        listbox = tk.Listbox(top)
-        listbox.pack(expand=True, fill="both", padx=10, pady=5)
-        for f in files:
-            listbox.insert(tk.END, f)
-        def on_select():
-            if not listbox.curselection(): return
-            filename = listbox.get(listbox.curselection())
-            self.current_excel_path = os.path.join(self.storage_dir, filename)
-            self.entry_xlsx.config(state='normal')
-            self.entry_xlsx.delete(0, tk.END)
-            self.entry_xlsx.insert(0, filename)
-            self.entry_xlsx.config(state='readonly')
-            top.destroy()
-        ttk.Button(top, text="Select", command=on_select).pack(pady=5)
-        
-    def _cell_to_indices(self, cell_str):
-        import re
-        match = re.match(r"([A-Z]+)([0-9]+)", cell_str.upper())
-        if not match:
-            raise ValueError(f"Invalid cell format: '{cell_str}'")
-        col_str, row_str = match.groups()
-        row = int(row_str) - 1
-        col = 0
-        for char in col_str:
-            col = col * 26 + (ord(char) - ord('A') + 1)
-        return row, col - 1
-
-    def _write_to_excel(self):
-        if not self.current_excel_path or not self.properties or not self.node_listbox.curselection():
-            messagebox.showerror("Missing Data", "Ensure a node is selected, a target datasheet is chosen, and properties are mapped.")
-            return
-        self._update_status("Writing data to Excel...")
-        node = self.node_listbox.get(self.node_listbox.curselection())
-        def task():
-            try:
-                abs_path = os.path.abspath(self.current_excel_path)
-                sheet_name = self.entry_sheet.get().strip() or "Sheet1"
-                df = pd.read_excel(abs_path, sheet_name=sheet_name, header=None)
-                prefix = self.entry_prefix.get().strip()
-                for prop, val_cell, unit_cell in self.properties:
-                    query_bnode = f"{prefix} SELECT ?value ?unit WHERE {{ ex:{node} ex:{prop} [ ex:hasValue ?value ; ex:hasUnit ?unit ] . }}"
-                    res_bnode = self._run_sparql_query(query_bnode)
-                    val, uni = (res_bnode[0]["value"]["value"], res_bnode[0]["unit"]["value"]) if res_bnode else (None, None)
-                    if val is None:
-                        query_direct = f"{prefix} SELECT ?value WHERE {{ ex:{node} ex:{prop} ?value . FILTER(!isBlank(?value)) }}"
-                        res_direct = self._run_sparql_query(query_direct)
-                        if res_direct:
-                            val = res_direct[0]["value"]["value"]
-                    if val is not None:
-                        row, col = self._cell_to_indices(val_cell)
-                        df.iat[row, col] = val
-                    if uni is not None and unit_cell: 
-                        row, col = self._cell_to_indices(unit_cell)
-                        df.iat[row, col] = uni
-                df.to_excel(abs_path, sheet_name=sheet_name, index=False, header=False)
-                self.after(0, lambda: self._refresh_open_datasheet(abs_path))
-                self.after(0, lambda: messagebox.showinfo("Success", "Data written to datasheet and saved."))
-                self.after(0, lambda: self._update_status("Successfully wrote data to Excel.", 4000))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Write Error", f"An error occurred: {e}"))
-                self.after(0, lambda: self._update_status("Error writing to Excel.", 4000))
-        threading.Thread(target=task, daemon=True).start()
 
     def _update_file_lists(self):
         try:
-            files = sorted([f for f in os.listdir(self.storage_dir) if f.endswith(('.xlsx', '.xls'))])
+            files = sorted([f for f in os.listdir(self.storage_dir) if f.endswith(('.xlsx', '.xls', '.xlsm'))])
             self.file_listbox_manage.delete(0, tk.END)
             for f in files:
                 self.file_listbox_manage.insert(tk.END, f)
             self.datasheet_combobox['values'] = files
         except Exception as e:
             print(f"Error updating file list: {e}")
-            
+
     def _update_tag_lists(self):
         try:
             tags = sorted(self.tag_associations.keys())
@@ -597,7 +477,8 @@ class LeanDigitalTwin(tk.Tk):
             print(f"Error updating tag lists: {e}")
 
     def _import_datasheet_to_library(self):
-        paths = filedialog.askopenfilenames(title="Select Datasheet(s) to Import", filetypes=[("Excel files", "*.xlsx *.xls")])
+        paths = filedialog.askopenfilenames(title="Select Datasheet(s) to Import",
+                                            filetypes=[("Excel files", "*.xlsx *.xls *.xlsm")])
         if not paths: return
         imported_count = 0
         for path in paths:
@@ -619,20 +500,52 @@ class LeanDigitalTwin(tk.Tk):
             if not os.path.exists(abs_path):
                 messagebox.showerror("File Not Found", f"The file could not be found at:\n{abs_path}")
                 return
+
+            # Start Excel if it's not running, or connect to the existing instance
+            if self.xl_app is None:
+                # Create Excel app with add_book=False to prevent Book1 from opening
+                self.xl_app = xw.App(visible=True, add_book=False)
+                self.xl_app.display_alerts = False  # Suppress Excel alerts
+                self.xl_app.activate()  # Bring excel to front
+
+            # Close any existing workbook first
+            if self.current_xl_db:
+                try:
+                    self.current_xl_db.close()
+                except:
+                    pass
+                self.current_xl_db = None
+
+            # Close any unwanted Book1 that might have opened
+            try:
+                for book in self.xl_app.books:
+                    if book.name.startswith("Book") and len(book.sheets) == 1 and book.sheets[0].name == "Sheet1":
+                        # Check if it's an empty workbook
+                        if book.sheets[0].used_range is None:
+                            book.close()
+            except:
+                pass
+
+            # Open the workbook
+            self.current_xl_db = self.xl_app.books.open(abs_path)
+            self.current_xl_db.activate()  # Make sure our workbook is active
             
-            self.current_workbook = pd.ExcelFile(abs_path)
-            sheet_names = self.current_workbook.sheet_names
-            
+            sheet_names = [sheet.name for sheet in self.current_xl_db.sheets]
+
             self.sheet_selector_combobox['values'] = sheet_names
             if sheet_names:
                 self.sheet_selector_combobox.set(sheet_names[0])
                 self._display_sheet(sheet_names[0])
 
             self.current_excel_path = abs_path
-            self._update_status(f"Opened '{os.path.basename(file_path)}'.", 4000)
+            self._update_status(f"Opened '{os.path.basename(file_path)}' in Excel.", 4000)
+
         except Exception as e:
-            messagebox.showerror("File Load Error", f"Failed to load the Excel file.\n\nError: {e}")
-            self.current_workbook = None
+            messagebox.showerror("xlwings Load Error",
+                                 f"Failed to open the Excel file. Is Excel installed?\n\nError: {e}")
+            self.current_xl_db = None
+            self.sheet_selector_combobox['values'] = []
+            self.sheet_selector_combobox.set('')
 
     def _on_sheet_selected(self, event=None):
         selected_sheet = self.sheet_selector_combobox.get()
@@ -640,90 +553,168 @@ class LeanDigitalTwin(tk.Tk):
             self._display_sheet(selected_sheet)
 
     def _display_sheet(self, sheet_name):
-        if not self.current_workbook: return
-        try:
-            df = pd.read_excel(self.current_workbook, sheet_name=sheet_name, engine='openpyxl')
-            for widget in self.excel_frame.winfo_children():
-                widget.destroy()
-            self.pt_table = Table(self.excel_frame, dataframe=df, showtoolbar=True, showstatusbar=True)
-            self.pt_table.show()
-        except Exception as e:
-            messagebox.showerror("Sheet Load Error", f"Could not load sheet '{sheet_name}'.\n\nError: {e}")
-
-    def _refresh_open_datasheet(self, file_path):
-        if self.current_excel_path and os.path.normpath(file_path).lower() == os.path.normpath(self.current_excel_path).lower():
-            self._load_excel_file(self.current_excel_path)
-
-    def _save_excel(self):
-        if not self.current_excel_path or not self.pt_table:
-            messagebox.showwarning("No File", "No datasheet is currently open to save.")
+        """Activates the specified sheet in the open Excel workbook."""
+        if not self.current_xl_db:
             return
         try:
-            df = self.pt_table.model.df
-            df.to_excel(self.current_excel_path, index=False, engine='openpyxl')
-            messagebox.showinfo("Success", "Datasheet saved successfully.")
-            self._update_status("File saved.", 4000)
+            self.current_xl_db.sheets[sheet_name].activate()
+            self._update_status(f"Activated sheet '{sheet_name}'.", 3000)
         except Exception as e:
-            messagebox.showerror("Save Error", f"Failed to save file: {e}")
-            
+            messagebox.showerror("Sheet Activation Error", f"Could not activate sheet '{sheet_name}'.\n\nError: {e}")
+
     def _save_excel_as(self):
-        if not self.current_excel_path or not self.pt_table:
-            messagebox.showwarning("No File", "A datasheet must be open to use 'Save As'.")
+        if not self.current_excel_path or not self.current_xl_db:
+            messagebox.showwarning("No File", "A datasheet must be open in Excel to use 'Save As'.")
             return
-        save_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")], title="Save Datasheet As")
+        save_path = filedialog.asksaveasfilename(defaultextension=".xlsx",
+                                                 filetypes=[("Excel files", "*.xlsx *.xlsm")],
+                                                 title="Save Datasheet As")
         if not save_path: return
         try:
             abs_save_path = os.path.abspath(save_path)
-            df = self.pt_table.model.df
-            df.to_excel(abs_save_path, index=False, engine='openpyxl')
+            self.current_xl_db.save(abs_save_path)
+
             filename = os.path.basename(abs_save_path)
             internal_path = os.path.join(self.storage_dir, filename)
+
+            # Ensure a copy is in the library
             if os.path.normpath(abs_save_path).lower() != os.path.normpath(internal_path).lower():
                 shutil.copyfile(abs_save_path, internal_path)
-            self.current_excel_path = internal_path
+
             self._update_file_lists()
-            messagebox.showinfo("Success", f"File exported as '{filename}' and a new copy was added to the application library.")
+            messagebox.showinfo("Success",
+                                f"File exported as '{filename}' and a copy was added/updated in the library.")
         except Exception as e:
             messagebox.showerror("Save As Error", f"Failed to save the file: {e}")
-            
+
     def _load_file_from_list(self, event=None):
         if not event.widget.curselection(): return
         file_name = event.widget.get(event.widget.curselection())
-        self._load_excel_file(os.path.join(self.storage_dir, file_name))
+
+        # If the selected file is already open, just activate it. Otherwise, load it.
+        if self.current_xl_db and self.current_xl_db.name == file_name:
+            self.current_xl_db.activate()
+        else:
+            self._load_excel_file(os.path.join(self.storage_dir, file_name))
 
     def _on_tag_selected_in_editor_tab(self, event=None):
         tag_name = self.tag_selector_combobox.get()
         if not tag_name: return
+
+        nodes = self.tag_associations.get(tag_name, {}).get('nodes', [])
+        if len(nodes) == 1:
+            self._set_active_node(nodes[0])
+        else:
+            self._set_active_node(None)
+
         self.datasheet_listbox_for_tag.delete(0, tk.END)
         if tag_name in self.tag_associations:
             for datasheet in self.tag_associations[tag_name].get('datasheets', []):
                 self.datasheet_listbox_for_tag.insert(tk.END, datasheet)
         self._display_tag_info_in_editor_view(tag_name)
 
+    def _on_property_double_click(self, event=None):
+        try:
+            index = self.properties_text_embed.index(f"@{event.x},{event.y} linestart")
+            line_end = self.properties_text_embed.index(f"{index} lineend")
+            line_text = self.properties_text_embed.get(index, line_end)
+
+            match = re.search(r"^\s*[-*]?\s*(\w+)", line_text)
+            if not match: return
+            prop = match.group(1)
+
+            if not prop: return
+
+            if not self.active_node:
+                self.live_value_button.config(text="Copy Value: (No Active Node)", command=lambda: None)
+                self.live_unit_button.config(text="Copy Unit: (No Active Node)", command=lambda: None)
+                messagebox.showinfo("Info",
+                                    "An active node must be set to see a live value preview.")
+                return
+
+            node = self.active_node
+            self._update_status(f"Fetching preview for {prop}...")
+
+            def task():
+                prefix = self.entry_prefix.get().strip()
+                query_bnode = f"{prefix} SELECT ?value ?unit WHERE {{ ex:{node} ex:{prop} ?bnode . ?bnode ex:hasValue ?value . OPTIONAL {{ ?bnode ex:hasUnit ?unit . }} }}"
+                res_bnode = self._run_sparql_query(query_bnode)
+                val, uni = (
+                    res_bnode[0]["value"]["value"], res_bnode[0].get("unit", {}).get("value")) if res_bnode else (
+                    None, None)
+
+                if val is None:
+                    query_direct = f"{prefix} SELECT ?value WHERE {{ ex:{node} ex:{prop} ?value . FILTER(isLiteral(?value)) }}"
+                    res_direct = self._run_sparql_query(query_direct)
+                    if res_direct:
+                        val = res_direct[0]["value"]["value"]
+
+                def update_ui():
+                    self.live_value_button.config(text=f"Copy Value: {val or '(none)'}",
+                                                  command=lambda v=val: self._copy_to_clipboard(v))
+                    self.live_unit_button.config(text=f"Copy Unit: {uni or '(none)'}",
+                                                 command=lambda u=uni: self._copy_to_clipboard(u))
+                    self._update_status("Preview loaded.", 4000)
+
+                self.after(0, update_ui)
+
+            threading.Thread(target=task, daemon=True).start()
+
+        except (tk.TclError, IndexError):
+            pass
+
     def _display_tag_info_in_editor_view(self, tag_name):
+        self.tag_text_embed.config(state='normal')
+        self.properties_text_embed.config(state='normal')
         self.tag_text_embed.delete(1.0, tk.END)
         self.properties_text_embed.delete(1.0, tk.END)
+
         if tag_name not in self.tag_associations:
             self.tag_text_embed.insert(tk.END, "Tag not found.")
+            self.tag_text_embed.config(state='disabled')
+            self.properties_text_embed.config(state='disabled')
             return
+
         self.tag_text_embed.insert(tk.END, f"Tag: {tag_name}")
         nodes = self.tag_associations[tag_name].get('nodes', [])
+
         if not nodes:
             self.properties_text_embed.insert(tk.END, "Tag has no associated nodes.")
-            return
-        self.properties_text_embed.insert(tk.END, f"Associated Nodes:\n- {'\n- '.join(nodes)}\n\nProperties:\n")
+        else:
+            node_list_str = '\n- '.join(nodes)
+            self.properties_text_embed.insert(tk.END,
+                                              f"Associated Nodes:\n- {node_list_str}\n\nProperties (from all nodes):\n")
+
+        self.tag_text_embed.config(state='disabled')
+        self.properties_text_embed.config(state='disabled')
+
+        if not nodes: return
+
         self._update_status(f"Fetching properties for tag '{tag_name}'...")
+
         def task():
             all_properties = set()
             prefix = self.entry_prefix.get().strip()
             for node in nodes:
-                query = f"{prefix}\nSELECT DISTINCT ?p WHERE {{ ex:{node} ?p ?o . FILTER(!isBlank(?o)) }}"
+                query = f"""{prefix}
+                SELECT DISTINCT ?p WHERE {{ 
+                    ex:{node} ?p ?o .
+                    FILTER (isLiteral(?o) || isBlank(?o))
+                }}"""
                 results = self._run_sparql_query(query)
                 if results:
-                    all_properties.update(p.split('#')[-1] for p in (res['p']['value'] for res in results) if p.split('#')[-1] not in ["hasValue", "hasUnit", "a", "type"])
-            prop_text = "\n".join(sorted(list(all_properties))) or "(No direct properties found)"
-            self.after(0, lambda: self.properties_text_embed.insert(tk.END, prop_text))
-            self.after(0, lambda: self._update_status(f"Info loaded for tag '{tag_name}'.", 4000))
+                    all_properties.update(p.split('#')[-1] for p in (res['p']['value'] for res in results) if
+                                          p.split('#')[-1] not in ["hasValue", "hasUnit", "a", "type"])
+            prop_text = "\n".join(f"- {p}" for p in sorted(list(all_properties))) or "(No direct properties found)"
+
+            def update_text():
+                self.properties_text_embed.config(state='normal')
+                self.properties_text_embed.insert(tk.END, prop_text)
+                self.properties_text_embed.config(state='disabled')
+                self._update_status(f"Info loaded for tag '{tag_name}'.", 4000)
+
+            self.after(0, update_text)
+
         threading.Thread(target=task, daemon=True).start()
 
     def _remove_file(self):
@@ -731,7 +722,16 @@ class LeanDigitalTwin(tk.Tk):
             messagebox.showwarning("No Selection", "Please select a file to remove from the library.")
             return
         file_name = self.file_listbox_manage.get(self.file_listbox_manage.curselection())
-        if messagebox.askyesno("Confirm Removal", f"Are you sure you want to permanently delete '{file_name}' from the library? This will also un-tag it from any associations."):
+
+        # If the file to be removed is currently open, close it first.
+        if self.current_xl_db and self.current_xl_db.name == file_name:
+            self.current_xl_db.close()
+            self.current_xl_db = None
+            self.sheet_selector_combobox['values'] = []
+            self.sheet_selector_combobox.set('')
+
+        if messagebox.askyesno("Confirm Removal",
+                               f"Are you sure you want to permanently delete '{file_name}' from the library? This will also un-tag it from any associations."):
             try:
                 os.remove(os.path.join(self.storage_dir, file_name))
                 for tag in self.tag_associations:
@@ -759,7 +759,8 @@ class LeanDigitalTwin(tk.Tk):
         self._show_tag_connections(tag_name=tag)
 
     def _show_tag_connections(self, event=None, tag_name=None):
-        tag = tag_name or (self.tag_listbox.get(self.tag_listbox.curselection()) if self.tag_listbox.curselection() else None)
+        tag = tag_name or (
+            self.tag_listbox.get(self.tag_listbox.curselection()) if self.tag_listbox.curselection() else None)
         if not tag: return
         self.nodes_display.delete(0, tk.END)
         self.datasheets_display.delete(0, tk.END)
@@ -773,8 +774,76 @@ class LeanDigitalTwin(tk.Tk):
         if not event.widget.curselection(): return
         file_name = event.widget.get(event.widget.curselection())
         self.main_notebook.select(2)
-        self._load_excel_file(os.path.join(self.storage_dir, file_name))
+        self._load_file_from_list(event)
+
+    def _on_node_manual_select(self, event=None):
+        if not self.node_listbox.curselection(): return
+        node_name = self.node_listbox.get(self.node_listbox.curselection())
+        self._set_active_node(node_name)
+
+    def _set_active_node(self, node_name):
+        self.active_node = node_name
+        if node_name:
+            self.active_node_display_label.config(text=node_name)
+            try:
+                idx = self.node_listbox.get(0, "end").index(node_name)
+                self.node_listbox.selection_clear(0, tk.END)
+                self.node_listbox.selection_set(idx)
+                self.node_listbox.see(idx)
+            except ValueError:
+                pass
+        else:
+            self.active_node_display_label.config(text="None (Select a tag with one node)")
+            self.node_listbox.selection_clear(0, tk.END)
+
+    def _copy_to_clipboard(self, value_to_copy):
+        if value_to_copy is None:
+            messagebox.showinfo("No Value", "There is no value to copy.")
+            return
+
+        self.clipboard_clear()
+        self.clipboard_append(str(value_to_copy))
+        self._update_status(f"'{value_to_copy}' copied to clipboard.", 3000)
+
+    def _paste_from_clipboard(self):
+        if not self.current_xl_db:
+            messagebox.showwarning("No Datasheet", "Please open a datasheet in Excel first.")
+            return
+
+        cell_address = self.paste_cell_entry.get().strip().upper()
+        if not re.match(r"^[A-Z]+[1-9][0-9]*$", cell_address):
+            messagebox.showwarning("Invalid Cell", "Please enter a valid cell address (e.g., A1, B5, C10).")
+            return
+
+        try:
+            clipboard_content = self.clipboard_get()
+
+            # Get the active sheet from the Excel workbook
+            sheet = self.current_xl_db.sheets.active
+
+            # Write the value to the cell and save the workbook
+            sheet.range(cell_address).value = clipboard_content
+            self.current_xl_db.save()
+
+            self._update_status(f"Pasted to {cell_address} in '{sheet.name}' and saved.", 4000)
+            self.paste_cell_entry.delete(0, tk.END)
+
+        except tk.TclError:
+            messagebox.showwarning("Empty Clipboard", "The clipboard is empty or contains no text.")
+        except Exception as e:
+            messagebox.showerror("Paste Error", f"An error occurred while pasting to Excel: {e}")
+
 
 if __name__ == "__main__":
-    app = LeanDigitalTwin()
-    app.mainloop()
+    # Check if Excel is installed before launching
+    try:
+        # This will raise an exception if it can't find a running instance or start a new one
+        app_check = xw.App(visible=False)
+        app_check.quit()
+
+        app = LeanDigitalTwin()
+        app.mainloop()
+    except Exception as e:
+        messagebox.showerror("Excel Not Found",
+                             "Could not connect to Microsoft Excel. Please ensure it is installed.\n\n"
+                             f"Error: {e}")

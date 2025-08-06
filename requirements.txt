@@ -1,6 +1,4 @@
-pandas>=2.3.1
-pandastable>=0.14.0
+xlwings>=0.30.0
 networkx>=3.5
 matplotlib>=3.10.5
 SPARQLWrapper>=2.0.0
-openpyxl>=3.1.5
